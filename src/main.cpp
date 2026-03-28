@@ -733,6 +733,7 @@ void startWorker() {
 
 						// Initialize new device
 						newDev.getBrightnessRange(&newDev.minBrightness, &newDev.maxBrightness);
+						newDev.minBrightness = 0;  // Allow going below HID LogMin
 						if (newDev.getBrightness(&newDev.currentBrightness) == 0) {
 							newDev.baseBrightness = newDev.currentBrightness;
 							newDev.baseLux = getAmbientLux(newDev);
