@@ -240,7 +240,8 @@ std::vector<DisplayDevice> hid_enumerate() {
 			dev.close();
 			continue;
 		}
-		if (brightIdx >= 0) {
+		bool isExact = (brightIdx >= 0);
+		if (isExact) {
 			Log::Info(L"  Matched brightness cap by UsagePage/Usage (index %d)", chosen);
 		} else {
 			Log::Info(L"  Using fallback cap (index %d), no exact brightness match", chosen);
@@ -250,6 +251,7 @@ std::vector<DisplayDevice> hid_enumerate() {
 		dev.featCaps.id    = bc.ReportID;
 		dev.featCaps.page  = bc.UsagePage;
 		dev.featCaps.usage = bc.IsRange ? bc.Range.UsageMin : bc.NotRange.Usage;
+		dev.exactMatch     = isExact;
 
 		// Assign type and name
 		if (profile) {
@@ -266,19 +268,29 @@ std::vector<DisplayDevice> hid_enumerate() {
 		// Query ContainerId
 		dev.containerId = queryContainerId(set, &devInfo);
 
-		// Deduplicate: skip if we already have a device with the same ContainerId
+		// Deduplicate: skip if we already have a device with the same ContainerId.
+		// Exception: if the new device has an exact brightness match and the
+		// existing one was only a fallback, replace the existing one so we use
+		// the correct HID interface for brightness control.
 		static const GUID emptyGuid = {};
 		if (memcmp(&dev.containerId, &emptyGuid, sizeof(GUID)) != 0) {
 			bool dup = false;
-			for (const auto &existing : result) {
-				if (memcmp(&existing.containerId, &dev.containerId, sizeof(GUID)) == 0) {
+			size_t dupIdx = 0;
+			for (size_t ri = 0; ri < result.size(); ++ri) {
+				if (memcmp(&result[ri].containerId, &dev.containerId, sizeof(GUID)) == 0) {
 					dup = true;
+					dupIdx = ri;
 					break;
 				}
 			}
 			if (dup) {
-				Log::Info(L"  Duplicate ContainerId, skipping (already opened via another interface)");
-				dev.close();
+				if (dev.exactMatch && !result[dupIdx].exactMatch) {
+					Log::Info(L"  Replacing fallback interface with exact brightness match");
+					result[dupIdx] = std::move(dev);
+				} else {
+					Log::Info(L"  Duplicate ContainerId, skipping (already opened via another interface)");
+					dev.close();
+				}
 				continue;
 			}
 		}

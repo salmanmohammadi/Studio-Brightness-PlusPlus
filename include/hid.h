@@ -56,6 +56,9 @@ struct DisplayDevice {
 	// Nit calibration for proportional brightness matching
 	float maxNits = 600.f;
 
+	// True if brightness cap was matched by exact UsagePage/Usage (not fallback)
+	bool exactMatch = false;
+
 	DisplayDevice() = default;
 	~DisplayDevice() { close(); }
 
@@ -68,7 +71,7 @@ struct DisplayDevice {
 	      containerId(o.containerId), currentBrightness(o.currentBrightness),
 	      baseBrightness(o.baseBrightness),
 	      minBrightness(o.minBrightness), maxBrightness(o.maxBrightness), baseLux(o.baseLux),
-	      maxNits(o.maxNits) {
+	      maxNits(o.maxNits), exactMatch(o.exactMatch) {
 		o.hDev = INVALID_HANDLE_VALUE;
 		o.prep = nullptr;
 	}
@@ -81,7 +84,7 @@ struct DisplayDevice {
 			containerId = o.containerId;
 			currentBrightness = o.currentBrightness; baseBrightness = o.baseBrightness;
 			minBrightness = o.minBrightness; maxBrightness = o.maxBrightness;
-			baseLux = o.baseLux; maxNits = o.maxNits;
+			baseLux = o.baseLux; maxNits = o.maxNits; exactMatch = o.exactMatch;
 			o.hDev = INVALID_HANDLE_VALUE;
 			o.prep = nullptr;
 		}
