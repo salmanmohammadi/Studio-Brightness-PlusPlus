@@ -109,7 +109,16 @@ int DisplayDevice::setBrightness(ULONG v) {
 		          GetLastError(), featCaps.len);
 		return -4;
 	}
-	Log::Info(L"  setBrightness: OK val=%lu len=%u id=0x%02X", v, featCaps.len, featCaps.id);
+	// Verify: read back to check if device accepted the value
+	ULONG readback = 0;
+	std::vector<uint8_t> vbuf(featCaps.len, 0);
+	vbuf[0] = featCaps.id;
+	if (HidD_GetFeature(hDev, vbuf.data(), (ULONG)vbuf.size())) {
+		HidP_GetUsageValue(HidP_Feature, featCaps.page, 0, featCaps.usage, &readback, prep,
+		                   reinterpret_cast<PCHAR>(vbuf.data()), featCaps.len);
+	}
+	Log::Info(L"  setBrightness: OK wrote=%lu readback=%lu len=%u id=0x%02X",
+	          v, readback, featCaps.len, featCaps.id);
 	return 0;
 }
 
