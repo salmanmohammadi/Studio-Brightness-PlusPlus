@@ -19,6 +19,8 @@
 #include <atomic>
 #include <mutex>
 #include <gdiplus.h>
+#include <highlevelmonitorconfigurationapi.h>
+#include <physicalmonitorenumerationapi.h>
 
 #include "hid.h"
 #include "resource.h"
@@ -33,6 +35,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "dxva2.lib")
 
 using Microsoft::WRL::ComPtr;
 using namespace Gdiplus;
@@ -45,6 +48,31 @@ constexpr wchar_t kWndClass[]          = L"StudioBrightnessClass";
 
 constexpr wchar_t kReleaseUrl[] = L"https://github.com/LitteRabbit-37/Studio-Brightness-PlusPlus/releases";
 constexpr wchar_t kAppVersion[] = L"2.1.2";
+
+/* ---------- DDC/CI probe ---------- */
+static BOOL CALLBACK ddcProbeMonitor(HMONITOR hMon, HDC, LPRECT, LPARAM) {
+	DWORD count = 0;
+	if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hMon, &count) || count == 0)
+		return TRUE;
+	std::vector<PHYSICAL_MONITOR> mons(count);
+	if (!GetPhysicalMonitorsFromHMONITOR(hMon, count, mons.data()))
+		return TRUE;
+	for (DWORD i = 0; i < count; ++i) {
+		Log::Info(L"DDC/CI probe: \"%s\"", mons[i].szPhysicalMonitorDescription);
+		DWORD mn = 0, cur = 0, mx = 0;
+		if (GetMonitorBrightness(mons[i].hPhysicalMonitor, &mn, &cur, &mx)) {
+			Log::Info(L"  DDC/CI brightness: min=%lu cur=%lu max=%lu", mn, cur, mx);
+		} else {
+			Log::Warn(L"  DDC/CI GetMonitorBrightness failed (err=%lu)", GetLastError());
+		}
+		DestroyPhysicalMonitor(mons[i].hPhysicalMonitor);
+	}
+	return TRUE;
+}
+static void probeDDCCI() {
+	Log::Info(L"Probing DDC/CI on all monitors...");
+	EnumDisplayMonitors(nullptr, nullptr, ddcProbeMonitor, 0);
+}
 
 /* ---------- system tray icon GUID ---------- */
 DEFINE_GUID(GUID_PrinterIcon, 0x9d0b8b92, 0x4e1c, 0x488e, 0xa1, 0xe1, 0x23, 0x31, 0xaf, 0xce, 0x2c, 0xb5);
@@ -794,6 +822,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 	InitCommonControlsEx(&icc);
 
 	g_settings.Load();
+	probeDDCCI();
 	bool realStartup = g_settings.IsStartupEnabled();
 	if (g_settings.runAtStartup != realStartup) {
 		if (g_settings.runAtStartup) g_settings.SetStartup(true);
