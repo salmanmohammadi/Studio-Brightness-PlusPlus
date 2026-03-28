@@ -109,6 +109,7 @@ int DisplayDevice::setBrightness(ULONG v) {
 		          GetLastError(), featCaps.len);
 		return -4;
 	}
+	Log::Info(L"  setBrightness: OK val=%lu len=%u id=0x%02X", v, featCaps.len, featCaps.id);
 	return 0;
 }
 
