@@ -92,34 +92,13 @@ int DisplayDevice::setBrightness(ULONG v) {
 		return -1;
 	std::vector<uint8_t> buf(featCaps.len, 0);
 	buf[0] = featCaps.id;
-	if (!HidD_GetFeature(hDev, buf.data(), (ULONG)buf.size())) {
-		Log::Warn(L"  setBrightness: GetFeature failed (err=%lu, len=%u, id=0x%02X)",
-		          GetLastError(), featCaps.len, featCaps.id);
+	if (!HidD_GetFeature(hDev, buf.data(), (ULONG)buf.size()))
 		return -2;
-	}
 	NTSTATUS s = HidP_SetUsageValue(HidP_Feature, featCaps.page, 0, featCaps.usage, v, prep,
 	                                reinterpret_cast<PCHAR>(buf.data()), featCaps.len);
-	if (s != HIDP_STATUS_SUCCESS) {
-		Log::Warn(L"  setBrightness: SetUsageValue failed (status=0x%08X, val=%lu)",
-		          (unsigned)s, v);
+	if (s != HIDP_STATUS_SUCCESS)
 		return -3;
-	}
-	if (!HidD_SetFeature(hDev, buf.data(), featCaps.len)) {
-		Log::Warn(L"  setBrightness: SetFeature failed (err=%lu, len=%u)",
-		          GetLastError(), featCaps.len);
-		return -4;
-	}
-	// Verify: read back to check if device accepted the value
-	ULONG readback = 0;
-	std::vector<uint8_t> vbuf(featCaps.len, 0);
-	vbuf[0] = featCaps.id;
-	if (HidD_GetFeature(hDev, vbuf.data(), (ULONG)vbuf.size())) {
-		HidP_GetUsageValue(HidP_Feature, featCaps.page, 0, featCaps.usage, &readback, prep,
-		                   reinterpret_cast<PCHAR>(vbuf.data()), featCaps.len);
-	}
-	Log::Info(L"  setBrightness: OK wrote=%lu readback=%lu len=%u id=0x%02X",
-	          v, readback, featCaps.len, featCaps.id);
-	return 0;
+	return HidD_SetFeature(hDev, buf.data(), featCaps.len) ? 0 : -4;
 }
 
 int DisplayDevice::getBrightnessRange(ULONG *mn, ULONG *mx) {
