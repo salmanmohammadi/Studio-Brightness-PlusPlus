@@ -124,6 +124,19 @@ int DisplayDevice::getBrightnessRange(ULONG *mn, ULONG *mx) {
 	return -2;
 }
 
+/* ---------- Candidate info collected in pass 1 (no device opened) ---------- */
+struct HidCandidate {
+	std::wstring     path;
+	GUID             containerId = {};
+	const DisplayProfile *profile = nullptr;
+	uint16_t         pid        = 0;
+	bool             exactMatch = false;
+	// Which value-cap index matched, and its details
+	UCHAR            reportId   = 0;
+	USAGE            page       = 0;
+	USAGE            usage      = 0;
+};
+
 /* ============================================================ */
 std::vector<DisplayDevice> hid_enumerate() {
 	std::vector<DisplayDevice> result;
@@ -137,7 +150,10 @@ std::vector<DisplayDevice> hid_enumerate() {
 		return result;
 	}
 
-	// Note: this function may be called periodically; keep logs minimal for known-empty scans
+	// --- Pass 1: scan all HID interfaces, classify candidates without opening ---
+	// We avoid opening devices in this pass so that fallback interfaces don't
+	// interfere with the display firmware before the correct interface is opened.
+	std::vector<HidCandidate> candidates;
 
 	SP_DEVICE_INTERFACE_DATA ifd{sizeof(ifd)};
 
@@ -170,44 +186,43 @@ std::vector<DisplayDevice> hid_enumerate() {
 			Log::Info(L"Found unknown Apple HID (PID 0x%04X): %s", pid, path);
 		}
 
-		// Open device
-		DisplayDevice dev;
-		dev.devicePath = path;
-		dev.hDev = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-		                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-		                       OPEN_EXISTING, 0, nullptr);
-		if (dev.hDev == INVALID_HANDLE_VALUE) {
+		// Open device temporarily to read HID caps
+		HANDLE hDev = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+		                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+		                          OPEN_EXISTING, 0, nullptr);
+		if (hDev == INVALID_HANDLE_VALUE) {
 			Log::Warn(L"  CreateFile failed (%lu), skipping", GetLastError());
 			continue;
 		}
 
-		if (!HidD_GetPreparsedData(dev.hDev, &dev.prep)) {
+		PHIDP_PREPARSED_DATA prep = nullptr;
+		if (!HidD_GetPreparsedData(hDev, &prep)) {
 			Log::Warn(L"  GetPreparsedData failed, skipping");
-			dev.close();
+			CloseHandle(hDev);
 			continue;
 		}
 
 		HIDP_CAPS caps{};
-		if (HidP_GetCaps(dev.prep, &caps) != HIDP_STATUS_SUCCESS) {
+		if (HidP_GetCaps(prep, &caps) != HIDP_STATUS_SUCCESS) {
 			Log::Warn(L"  GetCaps failed, skipping");
-			dev.close();
+			HidD_FreePreparsedData(prep);
+			CloseHandle(hDev);
 			continue;
 		}
 
-		dev.featCaps.len = caps.FeatureReportByteLength;
-
-		// Enumerate all Feature value caps and find the brightness control
 		USHORT numFeatVals = caps.NumberFeatureValueCaps;
 		if (numFeatVals == 0) {
 			Log::Info(L"  No Feature value caps, skipping");
-			dev.close();
+			HidD_FreePreparsedData(prep);
+			CloseHandle(hDev);
 			continue;
 		}
 		std::vector<HIDP_VALUE_CAPS> vcaps(numFeatVals);
-		NTSTATUS vcStatus = HidP_GetValueCaps(HidP_Feature, vcaps.data(), &numFeatVals, dev.prep);
+		NTSTATUS vcStatus = HidP_GetValueCaps(HidP_Feature, vcaps.data(), &numFeatVals, prep);
 		if (vcStatus != HIDP_STATUS_SUCCESS) {
 			Log::Warn(L"  HidP_GetValueCaps failed (0x%08X), skipping", (unsigned)vcStatus);
-			dev.close();
+			HidD_FreePreparsedData(prep);
+			CloseHandle(hDev);
 			continue;
 		}
 
@@ -220,8 +235,7 @@ std::vector<DisplayDevice> hid_enumerate() {
 			          vc.LogicalMin, vc.LogicalMax);
 		}
 
-		// Search for brightness: UsagePage 0x0082 (Monitor), Usage 0x0010 (Brightness)
-		// Fallback: any cap with ReportCount==1 and reasonable LogicalMax (>= 400)
+		// Search for brightness cap
 		int brightIdx = -1;
 		int fallbackIdx = -1;
 		for (USHORT vi = 0; vi < numFeatVals; ++vi) {
@@ -235,73 +249,123 @@ std::vector<DisplayDevice> hid_enumerate() {
 				fallbackIdx = vi;
 		}
 		int chosen = (brightIdx >= 0) ? brightIdx : fallbackIdx;
+
+		// Close the device — we'll reopen only the best candidate per display
+		HidD_FreePreparsedData(prep);
+		CloseHandle(hDev);
+
 		if (chosen < 0) {
 			Log::Warn(L"  No brightness value cap found among %u caps, skipping", numFeatVals);
-			dev.close();
 			continue;
 		}
+
 		bool isExact = (brightIdx >= 0);
 		if (isExact) {
 			Log::Info(L"  Matched brightness cap by UsagePage/Usage (index %d)", chosen);
 		} else {
-			Log::Info(L"  Using fallback cap (index %d), no exact brightness match", chosen);
+			Log::Info(L"  Fallback candidate (index %d), deferring", chosen);
 		}
 
 		auto &bc = vcaps[chosen];
-		dev.featCaps.id    = bc.ReportID;
-		dev.featCaps.page  = bc.UsagePage;
-		dev.featCaps.usage = bc.IsRange ? bc.Range.UsageMin : bc.NotRange.Usage;
-		dev.exactMatch     = isExact;
+		HidCandidate cand;
+		cand.path        = path;
+		cand.containerId = queryContainerId(set, &devInfo);
+		cand.profile     = profile;
+		cand.pid         = pid;
+		cand.exactMatch  = isExact;
+		cand.reportId    = bc.ReportID;
+		cand.page        = bc.UsagePage;
+		cand.usage       = bc.IsRange ? bc.Range.UsageMin : bc.NotRange.Usage;
+		candidates.push_back(std::move(cand));
+	}
 
-		// Assign type and name
-		if (profile) {
-			dev.type    = profile->type;
-			dev.name    = profile->name;
-			dev.maxNits = profile->maxNits;
+	SetupDiDestroyDeviceInfoList(set);
+
+	// --- Pass 2: for each physical display, pick best candidate and open it ---
+	// Prefer exact matches over fallbacks for the same ContainerId.
+	static const GUID emptyGuid = {};
+	std::vector<size_t> chosen; // indices into candidates
+
+	for (size_t ci = 0; ci < candidates.size(); ++ci) {
+		auto &cand = candidates[ci];
+		bool dominated = false;
+
+		// Check if we already selected a candidate for this ContainerId
+		if (memcmp(&cand.containerId, &emptyGuid, sizeof(GUID)) != 0) {
+			for (size_t si = 0; si < chosen.size(); ++si) {
+				auto &existing = candidates[chosen[si]];
+				if (memcmp(&existing.containerId, &cand.containerId, sizeof(GUID)) == 0) {
+					// Same physical display — keep the better one
+					if (cand.exactMatch && !existing.exactMatch) {
+						Log::Info(L"  Preferring exact match over fallback for %s",
+						          cand.path.c_str());
+						chosen[si] = ci;
+					} else {
+						Log::Info(L"  Duplicate ContainerId, skipping %s",
+						          cand.path.c_str());
+					}
+					dominated = true;
+					break;
+				}
+			}
+		}
+		if (!dominated)
+			chosen.push_back(ci);
+	}
+
+	// Now open only the selected candidates
+	for (size_t idx : chosen) {
+		auto &cand = candidates[idx];
+
+		DisplayDevice dev;
+		dev.devicePath = cand.path;
+		dev.hDev = CreateFileW(cand.path.c_str(), GENERIC_READ | GENERIC_WRITE,
+		                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+		                       OPEN_EXISTING, 0, nullptr);
+		if (dev.hDev == INVALID_HANDLE_VALUE) {
+			Log::Warn(L"  CreateFile failed on reopen (%lu), skipping", GetLastError());
+			continue;
+		}
+
+		if (!HidD_GetPreparsedData(dev.hDev, &dev.prep)) {
+			Log::Warn(L"  GetPreparsedData failed on reopen, skipping");
+			dev.close();
+			continue;
+		}
+
+		HIDP_CAPS caps{};
+		if (HidP_GetCaps(dev.prep, &caps) != HIDP_STATUS_SUCCESS) {
+			Log::Warn(L"  GetCaps failed on reopen, skipping");
+			dev.close();
+			continue;
+		}
+
+		dev.featCaps.len   = caps.FeatureReportByteLength;
+		dev.featCaps.id    = cand.reportId;
+		dev.featCaps.page  = cand.page;
+		dev.featCaps.usage = cand.usage;
+		dev.exactMatch     = cand.exactMatch;
+
+		if (cand.profile) {
+			dev.type    = cand.profile->type;
+			dev.name    = cand.profile->name;
+			dev.maxNits = cand.profile->maxNits;
 		} else {
 			dev.type    = DisplayType::AppleGeneric;
 			dev.name    = L"Apple Display (Unknown)";
 			dev.maxNits = 600.f;
-			Log::Warn(L"  PID 0x%04X not in profiles, using generic mode", pid);
+			Log::Warn(L"  PID 0x%04X not in profiles, using generic mode", cand.pid);
 		}
 
-		// Query ContainerId
-		dev.containerId = queryContainerId(set, &devInfo);
+		dev.containerId = cand.containerId;
 
-		// Deduplicate: skip if we already have a device with the same ContainerId.
-		// Exception: if the new device has an exact brightness match and the
-		// existing one was only a fallback, replace the existing one so we use
-		// the correct HID interface for brightness control.
-		static const GUID emptyGuid = {};
-		if (memcmp(&dev.containerId, &emptyGuid, sizeof(GUID)) != 0) {
-			bool dup = false;
-			size_t dupIdx = 0;
-			for (size_t ri = 0; ri < result.size(); ++ri) {
-				if (memcmp(&result[ri].containerId, &dev.containerId, sizeof(GUID)) == 0) {
-					dup = true;
-					dupIdx = ri;
-					break;
-				}
-			}
-			if (dup) {
-				if (dev.exactMatch && !result[dupIdx].exactMatch) {
-					Log::Info(L"  Replacing fallback interface with exact brightness match");
-					result[dupIdx] = std::move(dev);
-				} else {
-					Log::Info(L"  Duplicate ContainerId, skipping (already opened via another interface)");
-					dev.close();
-				}
-				continue;
-			}
-		}
-
-		Log::Info(L"  Opened: %s [Feature ID=0x%02X]",
-		          dev.name.c_str(), dev.featCaps.id);
+		Log::Info(L"  Opened: %s [Feature ID=0x%02X, %s]",
+		          dev.name.c_str(), dev.featCaps.id,
+		          dev.exactMatch ? L"exact" : L"fallback");
 
 		result.push_back(std::move(dev));
 	}
 
-	SetupDiDestroyDeviceInfoList(set);
 	if (!result.empty())
 		Log::Info(L"Enumeration complete: %zu display(s) found", result.size());
 	return result;
